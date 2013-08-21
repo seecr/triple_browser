@@ -1,0 +1,271 @@
+def prefixNamespace(uri):
+    for prefix, ns in namespaces.items():
+        if uri.startswith(ns):
+            return '%s:%s' % (prefix, uri[len(ns):])
+    return uri
+
+def executeQuery(server, port, query):
+    result = yield httpget(server, port, '/query?%s' % urlencode(dict(query=query)))
+    raise StopIteration(json_loads(result.split('\r\n\r\n', 1)[1]))
+
+def main(arguments, **kwargs):
+    server = arguments.get("server")[0]
+    port = int(arguments.get("port")[0])
+    uri = arguments.get("uri", [None])[0]
+    string = arguments.get("string", [None])[0]
+    limit = arguments.get("limit", ['20'])[0]
+
+    yield header()
+
+    if uri:
+        query = SUBJECT_QUERY % {'uri': uri, 'limit': limit}
+    elif string:
+        query = OBJECT_QUERY % {'string': string, 'limit': limit}
+    else:
+        query = DEFAULT_QUERY % limit
+
+    jsonResult = yield executeQuery(server, port, query)
+
+    subPredCount, objPredCount, subObjCount, allCount = 0, 0, 0, 0
+    if uri:
+        result = yield executeQuery(server, port, SUBJECT_PREDICATE_COUNT_QUERY % uri)
+        subPredCount = result['results']['bindings'][0]['count']['value']
+
+        result = yield executeQuery(server, port, OBJECT_PREDICATE_COUNT_QUERY % uri)
+        objPredCount = result['results']['bindings'][0]['count']['value']
+
+        result = yield executeQuery(server, port, SUBJECT_OBJECT_COUNT_QUERY % uri)
+        subObjCount = result['results']['bindings'][0]['count']['value']
+    elif string:
+        pass
+    else:
+        result = yield executeQuery(server, port, ALL_COUNT_QUERY)
+        allCount = result['results']['bindings'][0]['count']['value']
+
+    def createLink(binding, bindingLabel=None):
+        if binding["type"] != 'uri':
+            return '<a href="?%s">%s</a>' % (urlencode(dict(
+                    server=server,
+                    port=port,
+                    string=binding['value']
+                )),
+                prefixNamespace(binding['value']),
+            )
+        return '<a href="?%s">%s</a> %s' % (urlencode(dict(
+                    server=server,
+                    port=port,
+                    uri=binding['value']
+                )),
+                prefixNamespace(binding['value']),
+                ('(%s)' % bindingLabel['value']) if bindingLabel else ''
+            )
+
+    def generateTable(name, headers, bindings, count=0):
+        yield "<div id='content'><h3>%s" % name
+        if uri or string:
+            yield ': %s' % createLink({'type': 'uri' if uri else 'string', 'value': uri or string}, uriLabelBinding)
+        yield "(%s)</h3>" % count
+        yield """<table>
+            <tr>
+                <th>%s</th>
+                <th>%s</th>
+            </tr>""" % headers
+        for binding in bindings:
+            yield "<tr><td>%s</td><td>%s</td></tr>" % binding
+        yield "</table></div>"
+
+    asSubject = []
+    asObject = []
+    asPredicate = []
+    # count = jsonResult['results']['bindings'][0]['count']['value']
+    uriLabel = None
+
+    for binding in jsonResult['results']['bindings']:
+        if not uri or 'object' not in binding:
+            asObject.append((
+                createLink(
+                        binding['subject'],
+                        binding['subjectLabel'] if 'subjectLabel' in binding else None),
+                createLink(
+                        binding['predicate'],
+                        binding['predicateLabel'] if 'predicateLabel' in binding else None),
+            ))
+        if not uri or 'subject' not in binding:
+            uriLabel = binding['subjectLabel']['value'] if 'subjectLabel' in binding else None
+            asSubject.append((
+                createLink(
+                        binding['predicate'],
+                        binding['predicateLabel'] if 'predicateLabel' in binding else None),
+                createLink(
+                        binding['object'],
+                        binding['objectLabel'] if 'objectLabel' in binding else None)
+            ))
+        if not uri or 'predicate' not in binding:
+            asPredicate.append((
+                createLink(
+                        binding['subject'],
+                        binding['subjectLabel'] if 'subjectLabel' in binding else None),
+                createLink(
+                        binding['object'],
+                        binding['objectLabel'] if 'objectLabel' in binding else None)
+            ))
+
+    uriLabelBinding = {'type': 'literal', 'value': uriLabel} if uriLabel else None
+
+    yield generateTable('Subject', ('Predicate', 'Object'), asSubject, objPredCount or allCount)
+    yield generateTable('Object', ('Subject', 'Predicate'), asObject, subPredCount or allCount)
+    yield generateTable('Predicate', ('Subject', 'Object'), asPredicate, subObjCount or allCount)
+
+    yield footer()
+
+def header():
+    yield """<html>
+<head>
+    <link rel="stylesheet" type="text/css" href="http://cdn.seecr.nl/css/seecr-view.css"/>
+    <style>
+        body {
+            background: white;
+        }
+
+        table, th, td {
+            border: 1px solid #CCCCCC;
+        }
+
+        td {
+            padding: 2px;
+        }
+
+        table {
+            font-size: 9pt;
+            font-family: "TitilliumText22LMedium", fixed;
+            border-collapse:collapse;
+        }
+
+        a {
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>"""
+
+def footer():
+    yield "</body></html>"
+
+SUBJECT_QUERY = """
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+PREFIX rdfs: <http://www.w3.org/TR/rdf-schema/>
+SELECT ?subject ?predicate ?object ?subjectLabel ?predicateLabel ?objectLabel WHERE
+{
+    {
+        SELECT * WHERE {
+            <%(uri)s> ?predicate ?object .
+            OPTIONAL { <%(uri)s> skos:prefLabel ?subjectLabel }
+            OPTIONAL { <%(uri)s> rdfs:label ?subjectLabel }
+            OPTIONAL { <%(uri)s> dcterms:title ?subjectLabel }
+            OPTIONAL { ?predicate skos:prefLabel ?predicateLabel }
+            OPTIONAL { ?predicate rdfs:label ?predicateLabel }
+            OPTIONAL { ?predicate dcterms:title ?predicateLabel }
+            OPTIONAL { ?object skos:prefLabel ?objectLabel }
+            OPTIONAL { ?object rdfs:label ?objectLabel }
+            OPTIONAL { ?object dcterms:title ?objectLabel }
+        }
+        LIMIT %(limit)s
+    }
+    UNION
+    {
+        SELECT * WHERE {
+            ?subject ?predicate <%(uri)s>
+            OPTIONAL { ?subject skos:prefLabel ?subjectLabel }
+            OPTIONAL { ?subject rdfs:label ?subjectLabel }
+            OPTIONAL { ?subject dcterms:title ?subjectLabel }
+            OPTIONAL { ?predicate skos:prefLabel ?predicateLabel }
+            OPTIONAL { ?predicate rdfs:label ?predicateLabel }
+            OPTIONAL { ?predicate dcterms:title ?predicateLabel }
+            OPTIONAL { <%(uri)s> skos:prefLabel ?objectLabel }
+        }
+        LIMIT %(limit)s
+    }
+    UNION
+    {
+        SELECT * WHERE {
+            ?subject <%(uri)s> ?object
+            OPTIONAL { ?subject skos:prefLabel ?subjectLabel }
+            OPTIONAL { ?subject rdfs:label ?subjectLabel }
+            OPTIONAL { ?subject dcterms:title ?subjectLabel }
+            OPTIONAL { <%(uri)s> skos:prefLabel ?predicateLabel }
+            OPTIONAL { <%(uri)s> rdfs:label ?predicateLabel }
+            OPTIONAL { <%(uri)s> dcterms:title ?predicateLabel }
+            OPTIONAL { ?object skos:prefLabel ?objectLabel }
+            OPTIONAL { ?object rdfs:label ?objectLabel }
+            OPTIONAL { ?object dcterms:title ?objectLabel }
+        }
+        LIMIT %(limit)s
+    }
+
+}
+"""
+
+OBJECT_QUERY = """
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+PREFIX rdfs: <http://www.w3.org/TR/rdf-schema/>
+SELECT ?subject ?predicate ("%(string)s" as ?object) ?subjectLabel ?predicateLabel WHERE
+{
+    ?subject ?predicate "%(string)s"
+    OPTIONAL { ?subject skos:prefLabel ?subjectLabel }
+    OPTIONAL { ?subject rdfs:label ?subjectLabel }
+    OPTIONAL { ?subject dcterms:title ?subjectLabel }
+    OPTIONAL { ?predicate skos:prefLabel ?predicateLabel }
+    OPTIONAL { ?predicate rdfs:label ?predicateLabel }
+    OPTIONAL { ?predicate dcterms:title ?predicateLabel }
+}
+LIMIT %(limit)s"""
+
+ALL_COUNT_QUERY = """SELECT (COUNT(*) as ?count) WHERE
+{
+    {
+        ?subject ?predicate ?object .
+    }
+}"""
+
+OBJECT_PREDICATE_COUNT_QUERY = """SELECT (COUNT(*) as ?count) WHERE
+{
+    {
+        <%s> ?predicate ?object .
+    }
+}"""
+
+SUBJECT_PREDICATE_COUNT_QUERY = """SELECT (COUNT(*) as ?count) WHERE
+{
+    {
+        ?subject ?predicate <%s> .
+    }
+}"""
+
+SUBJECT_OBJECT_COUNT_QUERY = """SELECT (COUNT(*) as ?count) WHERE
+{
+    {
+        ?subject <%s> ?object.
+    }
+}"""
+
+
+DEFAULT_QUERY = """
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+PREFIX rdfs: <http://www.w3.org/TR/rdf-schema/>
+SELECT ?subject ?predicate ?object ?subjectLabel ?predicateLabel ?objectLabel WHERE
+{
+    ?subject ?predicate ?object
+    OPTIONAL { ?subject skos:prefLabel ?subjectLabel }
+    OPTIONAL { ?subject rdfs:label ?subjectLabel }
+    OPTIONAL { ?subject dcterms:title ?subjectLabel }
+    OPTIONAL { ?predicate skos:prefLabel ?objectLabel }
+    OPTIONAL { ?predicate rdfs:label ?objectLabel }
+    OPTIONAL { ?predicate dcterms:title ?objectLabel }
+    OPTIONAL { ?object skos:prefLabel ?objectLabel }
+    OPTIONAL { ?object rdfs:label ?objectLabel }
+    OPTIONAL { ?object dcterms:title ?objectLabel }
+}
+LIMIT %s"""

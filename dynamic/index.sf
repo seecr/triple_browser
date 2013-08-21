@@ -1,0 +1,7 @@
+def main(**kwargs):
+    yield """<form method="GET" action="/resolve">
+    Server: <input type="text" name="server"/><br />
+    Poort: <input type="text" name="port"/><br />
+    Start-uri: <input type="text" name="uri"/><br />
+    Limit: <input type="text" name="limit" value="20"/><br />
+    <input type="submit" value="view"/>"""
